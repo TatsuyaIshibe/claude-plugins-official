@@ -339,7 +339,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has a file_path attribute, Read that file — it is a document (PDF, PPTX, etc.) the sender attached. If the tag has reply_to_text / reply_to_message_id / reply_to_user / reply_to_file attributes, the sender is quoting an earlier message — use that context to understand what they are referring to. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message to update a message you previously sent (e.g. progress → result).',
       '',
@@ -509,6 +509,28 @@ bot.on('message:text', async ctx => {
   await handleInbound(ctx, ctx.message.text, undefined)
 })
 
+bot.on('message:document', async ctx => {
+  const doc = ctx.message.document
+  const caption = ctx.message.caption ?? `(file: ${doc.file_name ?? 'document'})`
+  await handleInbound(ctx, caption, async () => {
+    try {
+      const file = await ctx.api.getFile(doc.file_id)
+      if (!file.file_path) return undefined
+      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+      const res = await fetch(url)
+      const buf = Buffer.from(await res.arrayBuffer())
+      const ext = extname(doc.file_name ?? '').slice(1) || (file.file_path.split('.').pop() ?? 'bin')
+      const path = join(INBOX_DIR, `${Date.now()}-${doc.file_unique_id}.${ext}`)
+      mkdirSync(INBOX_DIR, { recursive: true })
+      writeFileSync(path, buf)
+      return path
+    } catch (err) {
+      process.stderr.write(`telegram channel: document download failed: ${err}\n`)
+      return undefined
+    }
+  }, 'file')
+})
+
 bot.on('message:photo', async ctx => {
   const caption = ctx.message.caption ?? '(photo)'
   // Defer download until after the gate approves — any user can send photos,
@@ -539,6 +561,7 @@ async function handleInbound(
   ctx: Context,
   text: string,
   downloadImage: (() => Promise<string | undefined>) | undefined,
+  attachmentType: 'image' | 'file' = 'image',
 ): Promise<void> {
   const result = gate(ctx)
 
@@ -571,7 +594,28 @@ async function handleInbound(
       .catch(() => {})
   }
 
-  const imagePath = downloadImage ? await downloadImage() : undefined
+  const attachmentPath = downloadImage ? await downloadImage() : undefined
+  const attachmentMeta: Record<string, string> = {}
+  if (attachmentPath) {
+    attachmentMeta[attachmentType === 'image' ? 'image_path' : 'file_path'] = attachmentPath
+  }
+
+  // Extract reply-to context so Claude can see what message the user is quoting.
+  const replyMsg = ctx.message?.reply_to_message
+  const replyMeta: Record<string, string> = {}
+  if (replyMsg) {
+    replyMeta.reply_to_message_id = String(replyMsg.message_id)
+    const replyText =
+      ('text' in replyMsg ? replyMsg.text : undefined) ??
+      ('caption' in replyMsg ? replyMsg.caption : undefined)
+    if (replyText) replyMeta.reply_to_text = replyText
+    if (replyMsg.from) {
+      replyMeta.reply_to_user = replyMsg.from.username ?? String(replyMsg.from.id)
+    }
+    if ('document' in replyMsg && replyMsg.document) {
+      replyMeta.reply_to_file = replyMsg.document.file_name ?? 'document'
+    }
+  }
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
@@ -585,7 +629,8 @@ async function handleInbound(
         user: from.username ?? String(from.id),
         user_id: String(from.id),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
+        ...attachmentMeta,
+        ...replyMeta,
       },
     },
   })
