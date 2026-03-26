@@ -38,6 +38,42 @@ const CHAT_DB = join(homedir(), 'Library', 'Messages', 'chat.db')
 const STATE_DIR = process.env.IMESSAGE_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'imessage')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
+const DELIVERED_FILE = join(STATE_DIR, 'delivered.json')
+
+// File-based deduplication to handle multiple plugin instances (Claude Code harness respawn issue)
+// See: https://github.com/anthropics/claude-code/issues/36800
+type DeliveredState = { ids: string[]; ts: number }
+const MAX_DELIVERED_IDS = 500
+const DELIVERED_EXPIRY_MS = 5 * 60 * 1000 // 5 minutes
+
+function loadDelivered(): Set<string> {
+  try {
+    const raw = readFileSync(DELIVERED_FILE, 'utf8')
+    const state = JSON.parse(raw) as DeliveredState
+    // Expire old state
+    if (Date.now() - state.ts > DELIVERED_EXPIRY_MS) return new Set()
+    return new Set(state.ids)
+  } catch {
+    return new Set()
+  }
+}
+
+function saveDelivered(ids: Set<string>): void {
+  const arr = [...ids].slice(-MAX_DELIVERED_IDS)
+  const state: DeliveredState = { ids: arr, ts: Date.now() }
+  try {
+    mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+    writeFileSync(DELIVERED_FILE, JSON.stringify(state), { mode: 0o600 })
+  } catch {}
+}
+
+function markDelivered(id: string): boolean {
+  const ids = loadDelivered()
+  if (ids.has(id)) return false // already delivered
+  ids.add(id)
+  saveDelivered(ids)
+  return true // newly delivered
+}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -799,6 +835,13 @@ function handleInbound(r: Row): void {
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
   const content = text || (imagePath ? '(image)' : '')
+
+  // File-based deduplication: prevent duplicate delivery when harness respawns plugin
+  // (See: https://github.com/anthropics/claude-code/issues/36800)
+  if (!markDelivered(r.guid)) {
+    process.stderr.write(`imessage channel: skipping duplicate delivery for ${r.guid}\n`)
+    return
+  }
 
   void mcp.notification({
     method: 'notifications/claude/channel',
