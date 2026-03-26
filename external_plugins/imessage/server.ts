@@ -412,11 +412,19 @@ end run`
 // Normalise aggressively: macOS Messages can mangle whitespace, smart-quote,
 // or round-trip through attributedBody — so we trim, collapse runs of
 // whitespace, and cap length so minor trailing diffs don't break the match.
-const ECHO_WINDOW_MS = 15000
+const ECHO_WINDOW_MS = 30000
 const echo = new Map<string, number>()
 
 function echoKey(raw: string): string {
-  return raw.trim().replace(/\s+/g, ' ').slice(0, 120)
+  // Normalize more aggressively: remove all whitespace and punctuation variations,
+  // lowercase, and use a longer slice to better match transformed text.
+  return raw
+    .toLowerCase()
+    .replace(/[\s\u00A0\u2000-\u200B\u3000]/g, '') // all whitespace variants
+    .replace(/[''‚]/g, "'")  // smart quotes → straight
+    .replace(/[""„]/g, '"')
+    .replace(/[–—]/g, '-')   // dashes
+    .slice(0, 200)
 }
 
 function trackEcho(chatGuid: string, key: string): void {
